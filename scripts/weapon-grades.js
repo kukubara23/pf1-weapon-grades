@@ -115,7 +115,7 @@ function blockMax(count, faces) {
  * modifier on the base (added on top of the grade's flat).
  * @returns {string} e.g. "4d4+5", "sizeRoll(2, 6, @size)+3"
  */
-function buildGradedFormula(baseFormula, grade) {
+function buildGradedFormula(baseFormula, grade, label = "") {
   const base = parseDamagePart(baseFormula);
   if (!base) return null;
 
@@ -133,9 +133,16 @@ function buildGradedFormula(baseFormula, grade) {
   }
 
   const totalFlat = base.flat + added;
-  let formula = renderDice(newCount, base.faces, base);
-  if (totalFlat > 0) formula += `+${totalFlat}`;
-  else if (totalFlat < 0) formula += `${totalFlat}`;
+  const dicePart = renderDice(newCount, base.faces, base);
+
+  // Optional inline labels, e.g. "sizeRoll(2, 4, @size)[Fine]+5[Fine]".
+  // NOTE: flavor on a function term (sizeRoll) is the risky part; flavor on
+  // the flat term is safe. Controlled by the `label` argument.
+  const tag = label ? `[${label}]` : "";
+
+  let formula = `${dicePart}${tag}`;
+  if (totalFlat > 0) formula += `+${totalFlat}${tag}`;
+  else if (totalFlat < 0) formula += `-${Math.abs(totalFlat)}${tag}`;
   return formula;
 }
 
@@ -176,6 +183,25 @@ function readBaseFormula(item) {
 
 Hooks.once("init", () => {
   log("Initializing");
+
+  game.settings.register(MODULE_ID, "inlineLabel", {
+    name: "Inline grade label in damage formula",
+    hint: "Adds e.g. [Fine] into the damage formula string. If a roll ever fails to parse, turn this off.",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: true
+  });
+
+  game.settings.register(MODULE_ID, "infoTag", {
+    name: "Show grade tag in weapon Info row",
+    hint: "Adds the grade (e.g. Fine) as a tag alongside Steel / Max range in the chat card Info row.",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: true
+  });
+
   game.modules.get(MODULE_ID).api = {
     GRADES,
     parseDamagePart,
@@ -228,7 +254,8 @@ async function applyGrade(item) {
     return resetGrade(item);
   }
 
-  const graded = buildGradedFormula(original, grade);
+  const useLabel = game.settings.get(MODULE_ID, "inlineLabel");
+  const graded = buildGradedFormula(original, grade, useLabel ? grade.label : "");
   if (!graded) {
     ui.notifications?.warn("Weapon Grades: couldn't build a graded formula.");
     return;
@@ -256,7 +283,8 @@ async function applyGrade(item) {
     [`flags.${FLAG_SCOPE}.${APPLIED_FLAG_KEY}`]: gradeKey
   };
 
-  await updateActionDamageParts(item, action, newParts, updates);
+  const showTag = game.settings.get(MODULE_ID, "infoTag");
+  await updateActionDamageParts(item, action, newParts, updates, showTag ? grade.label : null);
   log(`Applied ${grade.label}: "${original}" -> "${graded}"`);
   ui.notifications?.info(`Weapon Grades: applied ${grade.label} (${graded}).`);
 }
@@ -286,7 +314,8 @@ async function resetGrade(item) {
         [`flags.${FLAG_SCOPE}.${APPLIED_FLAG_KEY}`]: null,
         [`flags.${FLAG_SCOPE}.${FLAG_KEY}`]: "normal"
       };
-      await updateActionDamageParts(item, action, newParts, updates);
+      // gradeTag = null and clearTags=true removes any of our tags.
+      await updateActionDamageParts(item, action, newParts, updates, null, true);
       log(`Reset to original "${original}".`);
       ui.notifications?.info(`Weapon Grades: reset to ${original}.`);
       return;
@@ -301,19 +330,39 @@ async function resetGrade(item) {
   log("Reset: cleared applied state (no original to restore).");
 }
 
+/** All possible grade labels, used to strip our tags cleanly. */
+function allGradeLabels() {
+  return Object.values(GRADES).map((g) => g.label);
+}
+
 /**
  * Write modified damage parts back into the action and apply flag updates
- * in a single item update. PF1 stores actions in system.actions as an array;
- * we update the matching action's damage.parts.
+ * in a single item update. PF1 stores actions in system.actions as an array.
+ *
+ * @param {string|null} gradeTag  Label to add to the action's tags (or null).
+ * @param {boolean} clearTags     If true, remove all our grade tags.
  */
-async function updateActionDamageParts(item, action, newParts, extraUpdates = {}) {
-  // Build an actions array update. PF1 v11 keeps actions under system.actions.
+async function updateActionDamageParts(item, action, newParts, extraUpdates = {}, gradeTag = null, clearTags = false) {
   const actionsSource = foundry.utils.deepClone(item.system?.actions ?? []);
   const idx = actionsSource.findIndex((a) => a._id === action.id || a._id === action._id);
+
+  // Helper to compute a new tags array for an action source object.
+  const computeTags = (src) => {
+    const existing = Array.isArray(src.tags) ? src.tags.slice() : [];
+    const labels = allGradeLabels();
+    // Remove any prior grade tags first (so switching grades replaces).
+    const cleaned = existing.filter((t) => !labels.includes(t));
+    if (!clearTags && gradeTag) cleaned.push(gradeTag);
+    return cleaned;
+  };
+
   if (idx === -1) {
-    // Fall back: if we can't find it, try updating the action document directly.
     if (typeof action.update === "function") {
-      await action.update({ "damage.parts": newParts });
+      const upd = { "damage.parts": newParts };
+      if (gradeTag !== null || clearTags) {
+        upd.tags = computeTags(action.toObject?.() ?? action);
+      }
+      await action.update(upd);
       if (Object.keys(extraUpdates).length) await item.update(extraUpdates);
       return;
     }
@@ -323,6 +372,9 @@ async function updateActionDamageParts(item, action, newParts, extraUpdates = {}
 
   actionsSource[idx].damage = actionsSource[idx].damage ?? {};
   actionsSource[idx].damage.parts = newParts;
+  if (gradeTag !== null || clearTags) {
+    actionsSource[idx].tags = computeTags(actionsSource[idx]);
+  }
 
   await item.update({
     "system.actions": actionsSource,
