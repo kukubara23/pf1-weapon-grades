@@ -170,8 +170,11 @@ function findBasePart(parts) {
   if (!parts) return null;
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i];
-    const f = (p && typeof p === "object" && "formula" in p) ? p.formula
-            : Array.isArray(p) ? p[0] : null;
+    if (!p) continue;
+    let f = null;
+    if (typeof p === "object" && !Array.isArray(p) && "formula" in p) f = p.formula;
+    else if (Array.isArray(p)) f = p[0];
+    if (typeof f !== "string" || !f.length) continue; // skip empty {} parts
     if (parseDamagePart(f)) return { index: i, part: p, formula: f };
   }
   return null;
@@ -483,8 +486,7 @@ function injectGradeUI(app, htmlArg) {
     : (htmlArg?.[0] instanceof HTMLElement ? htmlArg[0] : null);
   if (!root) return;
 
-  const isApplied = !!(item.getFlag(FLAG_SCOPE, APPLIED_FLAG_KEY));
-  lockBaseDamageField(root, isApplied);
+  // Not locking the damage field — user keeps full edit access.
 
   if (root.querySelector(`[data-${MODULE_ID}-field]`)) return;
 
@@ -512,9 +514,8 @@ function injectGradeUIAction(app, htmlArg) {
     : (htmlArg?.[0] instanceof HTMLElement ? htmlArg[0] : null);
   if (!root) return;
 
-  // Lock the damage formula field on the action sheet too.
-  const isApplied = !!(item.getFlag(FLAG_SCOPE, APPLIED_FLAG_KEY));
-  lockBaseDamageField(root, isApplied);
+  // NOTE: intentionally NOT locking the damage field on the action sheet —
+  // the user wants to keep editing the formula and adding base instances.
 
   if (root.querySelector(`[data-${MODULE_ID}-field]`)) return;
 
@@ -606,53 +607,48 @@ Hooks.on("updateItem", async (item, changes, options, userId) => {
   const appliedKey = item.getFlag(FLAG_SCOPE, APPLIED_FLAG_KEY);
   if (!appliedKey) return; // nothing should be applied
 
-  const original = item.getFlag(FLAG_SCOPE, ORIG_FLAG_KEY);
-  if (!original) return;
-
-  const grade = GRADES[appliedKey];
-  if (!grade) return;
-
-  const currentBase = readBaseFormula(item);
-  if (!currentBase) return;
-
-  // Compute what the applied formula SHOULD look like.
-  const useLabel = game.settings.get(MODULE_ID, "inlineLabel");
-  const expected = buildGradedFormula(original, grade, useLabel ? grade.label : "");
-
-  // Normalize by stripping labels/whitespace for comparison.
-  const norm = (s) => (s || "").replace(/\[[^\]]*\]/g, "").replace(/\s+/g, "");
-
-  // Already correct? Nothing to do.
-  if (norm(currentBase) === norm(expected)) return;
-
-  // Only self-heal when the base looks like it was WIPED back to the pristine
-  // original (the Create Attack signature). We do NOT heal arbitrary
-  // mismatches, so that manually editing the dropdown or formula doesn't
-  // trigger an unwanted auto-apply.
-  const cleanOriginal = (() => {
-    const p = parseDamagePart(original);
-    if (!p) return norm(original);
-    let f = renderDice(p.count, p.faces, p);
-    if (p.flat > 0) f += `+${p.flat}`; else if (p.flat < 0) f += `${p.flat}`;
-    return norm(f);
-  })();
-
-  if (norm(currentBase) !== cleanOriginal) {
-    log(`Self-heal: base "${currentBase}" is neither graded nor pristine; leaving alone.`);
-    return;
-  }
-
-  log(`Self-heal: base reverted to original "${original}". Re-applying ${grade.label}.`);
-  _healing = true;
   try {
-    // Ensure the selected-grade flag matches what should be applied, since
-    // applyGrade reads FLAG_KEY to decide what to apply.
-    if (item.getFlag(FLAG_SCOPE, FLAG_KEY) !== appliedKey) {
-      await item.setFlag(FLAG_SCOPE, FLAG_KEY, appliedKey);
+    const original = item.getFlag(FLAG_SCOPE, ORIG_FLAG_KEY);
+    if (!original) return;
+
+    const grade = GRADES[appliedKey];
+    if (!grade) return;
+
+    const currentBase = readBaseFormula(item);
+    if (!currentBase) return;
+
+    const useLabel = game.settings.get(MODULE_ID, "inlineLabel");
+    const expected = buildGradedFormula(original, grade, useLabel ? grade.label : "");
+    const norm = (s) => (s || "").replace(/\[[^\]]*\]/g, "").replace(/\s+/g, "");
+
+    if (norm(currentBase) === norm(expected)) return; // already correct
+
+    const cleanOriginal = (() => {
+      const p = parseDamagePart(original);
+      if (!p) return norm(original);
+      let f = renderDice(p.count, p.faces, p);
+      if (p.flat > 0) f += `+${p.flat}`; else if (p.flat < 0) f += `${p.flat}`;
+      return norm(f);
+    })();
+
+    if (norm(currentBase) !== cleanOriginal) {
+      log(`Self-heal: base "${currentBase}" is neither graded nor pristine; leaving alone.`);
+      return;
     }
-    await applyGrade(item);
-  } finally {
+
+    log(`Self-heal: base reverted to original "${original}". Re-applying ${grade.label}.`);
+    _healing = true;
+    try {
+      if (item.getFlag(FLAG_SCOPE, FLAG_KEY) !== appliedKey) {
+        await item.setFlag(FLAG_SCOPE, FLAG_KEY, appliedKey);
+      }
+      await applyGrade(item);
+    } finally {
+      _healing = false;
+    }
+  } catch (err) {
     _healing = false;
+    console.error(`${MODULE_ID} | Self-heal error:`, err);
   }
 });
 
