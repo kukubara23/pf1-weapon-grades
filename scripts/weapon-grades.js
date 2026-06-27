@@ -281,9 +281,9 @@ Hooks.on("pf1PreActionUse", (actionUse) => {
     actionUse.shared.attackBonus.push(`${grade.attack}[${grade.label}]`);
   }
 
-  // Damage: add a SEPARATE instance for the grade's contribution.
-  // We compute from the pristine original (flag), never from the live
-  // formula, so it can never compound. The base part is left untouched.
+  // Damage: append a SEPARATE part for the grade's contribution.
+  // Computed from the pristine original (flag), never the live formula,
+  // so it cannot compound. The base part is left untouched.
   const original = getOriginalFormula(item);
   if (!original) {
     log("No pristine original formula available; skipping damage. " +
@@ -297,7 +297,45 @@ Hooks.on("pf1PreActionUse", (actionUse) => {
     return;
   }
 
-  log(`Original "${original}" + delta "${delta}" [${grade.label}]`);
-  actionUse.shared.damageBonus ??= [];
-  actionUse.shared.damageBonus.push(`${delta}[${grade.label}]`);
+  const action = actionUse.action;
+  const parts = action?.damage?.parts;
+  if (!Array.isArray(parts)) {
+    log("action.damage.parts is not an array; cannot inject damage.", parts);
+    return;
+  }
+
+  // Idempotency guard: the attack dialog can re-run this hook several
+  // times (your console showed repeats). Tag our part and bail if present.
+  const TAG = `__wg_${grade.key}`;
+  const already = parts.some((p) =>
+    (p && typeof p === "object" && p.__weaponGrade) ||
+    (Array.isArray(p) && p[2] === TAG));
+  if (already) {
+    log("Delta part already present; skipping duplicate injection.");
+    return;
+  }
+
+  // Mirror the shape + damage type of the existing base part.
+  const basePart = parts.find((p) => {
+    const f = (p && typeof p === "object" && "formula" in p) ? p.formula
+            : Array.isArray(p) ? p[0] : null;
+    return parseDamagePart(f);
+  });
+
+  let newPart;
+  if (basePart && typeof basePart === "object" && "formula" in basePart) {
+    // Object-shaped part {formula, types, ...}. Clone its type info.
+    newPart = foundry.utils.deepClone(basePart);
+    newPart.formula = delta;
+    newPart.__weaponGrade = grade.key; // our marker
+  } else if (Array.isArray(basePart)) {
+    // Tuple-shaped part [formula, type]. Append a 3rd marker element.
+    newPart = [delta, basePart[1] ?? "", TAG];
+  } else {
+    // No base part to mirror; push a minimal object part, untyped.
+    newPart = { formula: delta, types: [], __weaponGrade: grade.key };
+  }
+
+  log(`Injecting delta part "${delta}" [${grade.label}] mirroring`, basePart);
+  parts.push(newPart);
 });
