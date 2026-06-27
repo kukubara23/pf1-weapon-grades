@@ -1,0 +1,9 @@
+{
+  "PF1WeaponGrades.Label": "Weapon Grade",
+  "PF1WeaponGrades.Grade.normal": "Normal",
+  "PF1WeaponGrades.Grade.fine": "Fine",
+  "PF1WeaponGrades.Grade.exceptional": "Exceptional",
+  "PF1WeaponGrades.Grade.superior": "Superior",
+  "PF1WeaponGrades.Grade.legendary": "Legendary",
+  "PF1WeaponGrades.Grade.artifact": "Artifact"
+}
