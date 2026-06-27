@@ -2,7 +2,7 @@
   "id": "pf1-weapon-grades",
   "title": "PF1 Weapon Grades",
   "description": "Adds a Weapon Grade modifier (Normal, Fine, Exceptional, Superior, Legendary, Artifact) granting attack bonuses and scaling weapon damage based on the base weapon die.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "compatibility": {
     "minimum": "13",
     "verified": "13"
