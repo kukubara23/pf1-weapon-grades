@@ -94,6 +94,71 @@ function getItemGrade(item) {
   return grade ? { key, ...grade } : null;
 }
 
+const ORIG_FLAG_KEY = "originalDamage";
+
+/**
+ * Find the weapon's base damage formula string from its primary action.
+ * Returns the raw formula (e.g. "1d8") or null.
+ */
+function readBaseFormula(item) {
+  const action = item.firstAction ?? item.actions?.contents?.[0] ?? item.actions?.[0];
+  const parts = action?.damage?.parts;
+  if (!Array.isArray(parts)) return null;
+  for (const part of parts) {
+    const f = (part && typeof part === "object" && "formula" in part)
+      ? part.formula
+      : Array.isArray(part) ? part[0] : null;
+    if (parseDamagePart(f)) return f;
+  }
+  return null;
+}
+
+/**
+ * Return the pristine original base formula for the weapon.
+ * Prefers the stored flag; if absent, captures the current base formula
+ * into the flag (only safe when the weapon is at Normal grade, which is
+ * enforced by the caller / capture-on-normal hook).
+ */
+function getOriginalFormula(item) {
+  const flagged = item.getFlag(FLAG_SCOPE, ORIG_FLAG_KEY);
+  if (flagged) return flagged;
+  return readBaseFormula(item);
+}
+
+/**
+ * Compute the delta damage instance: the graded total minus the original
+ * base, expressed as a formula to be ADDED alongside the untouched base.
+ *
+ * graded total = buildGradedFormula(original)
+ * original     = NdM(+K)
+ * delta dice   = (graded.count - original.count) d M
+ * delta flat   = graded.flat - original.flat
+ *
+ * Returns a formula string, or null if there's nothing to add.
+ */
+function buildDeltaFormula(originalFormula, grade) {
+  const original = parseDamagePart(originalFormula);
+  if (!original) return null;
+
+  const gradedStr = buildGradedFormula(original, grade);
+  const graded = parseDamagePart(gradedStr);
+  if (!graded) return null;
+
+  const deltaCount = graded.count - original.count;
+  const deltaFlat = graded.flat - original.flat;
+
+  if (deltaCount === 0 && deltaFlat === 0) return null;
+
+  let f = "";
+  if (deltaCount > 0) f += `${deltaCount}d${original.faces}`;
+  if (deltaFlat !== 0) {
+    if (f && deltaFlat > 0) f += `+${deltaFlat}`;
+    else if (f && deltaFlat < 0) f += `${deltaFlat}`;
+    else f += `${deltaFlat}`; // delta is flat-only
+  }
+  return f || null;
+}
+
 /* -------------------------------------------- */
 /*  Init                                        */
 /* -------------------------------------------- */
@@ -105,7 +170,16 @@ Hooks.once("init", () => {
     GRADES,
     parseDamagePart,
     buildGradedFormula,
-    setDebug: (v) => { DEBUG = !!v; }
+    buildDeltaFormula,
+    setDebug: (v) => { DEBUG = !!v; },
+    /** Force (re)capture of a weapon's pristine original base formula. */
+    captureOriginal: async (item) => {
+      const base = readBaseFormula(item);
+      if (!base) return null;
+      await item.setFlag(FLAG_SCOPE, ORIG_FLAG_KEY, base);
+      log(`Manually captured original for ${item.name}: "${base}"`);
+      return base;
+    }
   };
 });
 
@@ -162,42 +236,35 @@ Hooks.on("renderItemSheet", injectGradeField);
 // If your weapon sheet doesn't show the field, tell me its sheet class name.
 
 /* -------------------------------------------- */
-/*  Apply attack + damage on action use         */
+/*  Capture pristine original on Normal          */
 /* -------------------------------------------- */
 
 /**
- * Mutate the action's damage parts and stash an attack bonus.
- * Returns true if a base damage part was successfully transformed.
+ * Whenever a weapon is updated to Normal grade (or has no original stored
+ * yet while at Normal), record its current base formula as the pristine
+ * original. This is the safe capture point because at Normal the stored
+ * base has no grade contribution.
  */
-function applyGradeToAction(actionUse, grade) {
-  const action = actionUse?.action;
-  const parts = action?.damage?.parts;
+Hooks.on("updateItem", async (item, changes) => {
+  if (item?.type !== "weapon") return;
+  if (!item.isOwner) return;
 
-  log("Action damage.parts shape:", parts);
+  const gradeKey = item.getFlag(FLAG_SCOPE, FLAG_KEY) ?? "normal";
+  if (gradeKey !== "normal") return;
 
-  if (!Array.isArray(parts) || parts.length === 0) return false;
+  const base = readBaseFormula(item);
+  if (!base) return;
 
-  let transformed = false;
-  for (const part of parts) {
-    // Support {formula, type} objects and [formula, type] tuples.
-    const formula = (part && typeof part === "object" && "formula" in part)
-      ? part.formula
-      : Array.isArray(part) ? part[0] : null;
+  const existing = item.getFlag(FLAG_SCOPE, ORIG_FLAG_KEY);
+  if (existing === base) return;
 
-    const parsed = parseDamagePart(formula);
-    if (!parsed) continue;
+  log(`Capturing pristine original for ${item.name}: "${base}"`);
+  await item.setFlag(FLAG_SCOPE, ORIG_FLAG_KEY, base);
+});
 
-    const newFormula = buildGradedFormula(parsed, grade);
-    log(`Rewriting base damage "${formula}" -> "${newFormula}"`);
-
-    if (part && typeof part === "object" && "formula" in part) part.formula = newFormula;
-    else if (Array.isArray(part)) part[0] = newFormula;
-
-    transformed = true;
-    break; // only the first base-weapon die
-  }
-  return transformed;
-}
+/* -------------------------------------------- */
+/*  Apply attack + damage on action use          */
+/* -------------------------------------------- */
 
 Hooks.on("pf1PreActionUse", (actionUse) => {
   const item = actionUse?.item;
@@ -206,51 +273,31 @@ Hooks.on("pf1PreActionUse", (actionUse) => {
 
   log("pf1PreActionUse for", item.name, "grade:", grade.key);
 
+  actionUse.shared ??= {};
+
   // Attack bonus (string sources are summed by the system).
   if (grade.attack !== 0) {
-    actionUse.shared ??= {};
     actionUse.shared.attackBonus ??= [];
     actionUse.shared.attackBonus.push(`${grade.attack}[${grade.label}]`);
   }
 
-  // Primary path: rewrite the base damage part in place.
-  const ok = applyGradeToAction(actionUse, grade);
-
-  // Fallback path: if the part couldn't be rewritten (cloned data,
-  // different shape, etc.), push a flat damage bonus so at least the
-  // numeric portion lands. This won't add extra dice, so it's a
-  // degraded mode — useful as a safety net during testing.
-  if (!ok) {
-    const base = parseDamagePartFromItem(item);
-    if (base) {
-      const fb = buildGradedFormula(base, grade);
-      log("Primary rewrite failed; fallback damage formula:", fb);
-      actionUse.shared ??= {};
-      actionUse.shared.damageBonus ??= [];
-      // Push the full graded formula as an extra damage source.
-      actionUse.shared.damageBonus.push(`${fb}[${grade.label}]`);
-    } else {
-      log("Fallback could not determine base weapon damage.");
-    }
+  // Damage: add a SEPARATE instance for the grade's contribution.
+  // We compute from the pristine original (flag), never from the live
+  // formula, so it can never compound. The base part is left untouched.
+  const original = getOriginalFormula(item);
+  if (!original) {
+    log("No pristine original formula available; skipping damage. " +
+        "Set this weapon to Normal once to capture its base die.");
+    return;
   }
+
+  const delta = buildDeltaFormula(original, grade);
+  if (!delta) {
+    log("No damage delta for this grade.");
+    return;
+  }
+
+  log(`Original "${original}" + delta "${delta}" [${grade.label}]`);
+  actionUse.shared.damageBonus ??= [];
+  actionUse.shared.damageBonus.push(`${delta}[${grade.label}]`);
 });
-
-/**
- * Best-effort read of the weapon's own base damage from the item data,
- * used only by the fallback path.
- */
-function parseDamagePartFromItem(item) {
-  // Common PF1 location: first damage part on the primary attack action.
-  const action = item.firstAction ?? item.actions?.contents?.[0] ?? item.actions?.[0];
-  const parts = action?.damage?.parts;
-  if (Array.isArray(parts)) {
-    for (const part of parts) {
-      const f = (part && typeof part === "object" && "formula" in part)
-        ? part.formula
-        : Array.isArray(part) ? part[0] : null;
-      const parsed = parseDamagePart(f);
-      if (parsed) return parsed;
-    }
-  }
-  return null;
-}
