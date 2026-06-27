@@ -66,6 +66,12 @@ function log(...args) {
 function parseDamagePart(formula) {
   if (!formula || typeof formula !== "string") return null;
 
+  // Strip any [flavor] brackets (our grade labels) before parsing, so a
+  // previously-applied formula like "sizeRoll(2, 6, @size)[Superior]+6[Superior]"
+  // can still be read back as a 2d6 base. Without this, Reset/re-Apply can't
+  // locate the base part.
+  formula = formula.replace(/\[[^\]]*\]/g, "").trim();
+
   const sr = formula.match(/^\s*sizeRoll\s*\(\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([^)]*))?\)\s*([+-]\s*\d+)?\s*$/i);
   if (sr) {
     return {
@@ -177,6 +183,27 @@ function readBaseFormula(item) {
   return bp ? bp.formula : null;
 }
 
+/**
+ * Return a clean, canonical base formula (labels stripped, re-rendered from
+ * the parsed components). Used when capturing the pristine original so a
+ * stored original is never polluted with grade labels or extra flat mods.
+ * NOTE: this also strips any pre-existing flat modifier on the true base,
+ * which is intended — the "original" we grade from is the pure dice block.
+ */
+function cleanBaseFormula(item) {
+  const raw = readBaseFormula(item);
+  if (!raw) return null;
+  const p = parseDamagePart(raw);
+  if (!p) return null;
+  // Re-render the pure dice block, preserving sizeRoll form, dropping flat
+  // and labels. (If a weapon legitimately has a base flat like 1d8+1, that
+  // flat is preserved below instead.)
+  let f = renderDice(p.count, p.faces, p);
+  if (p.flat > 0) f += `+${p.flat}`;
+  else if (p.flat < 0) f += `${p.flat}`;
+  return f;
+}
+
 /* -------------------------------------------- */
 /*  Init / API                                  */
 /* -------------------------------------------- */
@@ -242,7 +269,7 @@ async function applyGrade(item) {
       ui.notifications?.error("Weapon Grades: no pristine original stored but a grade is applied. Reset manually.");
       return;
     }
-    original = readBaseFormula(item);
+    original = cleanBaseFormula(item);
     if (!original) {
       ui.notifications?.warn("Weapon Grades: base damage isn't a recognized dice formula.");
       return;
