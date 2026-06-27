@@ -417,28 +417,15 @@ async function updateActionDamageParts(item, action, newParts, extraUpdates = {}
 /*  Sheet injection: dropdown + buttons + lock  */
 /* -------------------------------------------- */
 
-function injectGradeUI(app, htmlArg) {
-  const item = app?.item ?? app?.object;
-  if (item?.type !== "weapon") return;
-
-  const root = (htmlArg instanceof HTMLElement)
-    ? htmlArg
-    : (htmlArg?.[0] instanceof HTMLElement ? htmlArg[0] : null);
-  if (!root) {
-    log("Could not resolve sheet root element; skipping injection.");
-    return;
-  }
-
+/**
+ * Build the grade control element (dropdown + Apply/Reset + status).
+ * Shared between the item sheet and the action sheet.
+ */
+function buildGradeControl(item, app) {
   const appliedKey = item.getFlag(FLAG_SCOPE, APPLIED_FLAG_KEY) ?? null;
   const isApplied = !!appliedKey;
-
-  // Lock the base damage formula field whenever a grade is applied.
-  lockBaseDamageField(root, isApplied);
-
-  // Avoid duplicate control insertion on re-render.
-  if (root.querySelector(`[data-${MODULE_ID}-field]`)) return;
-
   const current = item.getFlag(FLAG_SCOPE, FLAG_KEY) ?? "normal";
+
   const options = Object.entries(GRADES)
     .map(([key, g]) =>
       `<option value="${key}" ${key === current ? "selected" : ""}>${g.label}</option>`)
@@ -450,37 +437,117 @@ function injectGradeUI(app, htmlArg) {
   wrapper.innerHTML = `
     <label>Weapon Grade</label>
     <div class="form-fields" style="gap:4px; align-items:center;">
-      <select name="flags.${FLAG_SCOPE}.${FLAG_KEY}" ${isApplied ? "disabled" : ""}>${options}</select>
+      <select data-wg-select ${isApplied ? "disabled" : ""}>${options}</select>
       <button type="button" data-wg-apply title="Overwrite base damage with the graded formula">Apply</button>
       <button type="button" data-wg-reset title="Restore original base damage and unlock">Reset</button>
     </div>
     <p class="notes" data-wg-status></p>`;
 
+  const status = wrapper.querySelector("[data-wg-status]");
+  if (status) {
+    status.textContent = isApplied
+      ? `Applied: ${GRADES[appliedKey]?.label ?? appliedKey}. Base damage locked; use Reset to edit.`
+      : `Not applied. Select a grade and click Apply.`;
+  }
+
+  // The dropdown writes the grade flag directly (no form submission needed,
+  // since the action sheet won't carry our field name through its own form).
+  const select = wrapper.querySelector("[data-wg-select]");
+  select?.addEventListener("change", async (ev) => {
+    await item.setFlag(FLAG_SCOPE, FLAG_KEY, ev.target.value);
+  });
+
+  wrapper.querySelector("[data-wg-apply]")?.addEventListener("click", async () => {
+    // Make sure the selected value is persisted before applying.
+    if (select) await item.setFlag(FLAG_SCOPE, FLAG_KEY, select.value);
+    await applyGrade(item);
+    app?.render(false);
+  });
+  wrapper.querySelector("[data-wg-reset]")?.addEventListener("click", async () => {
+    await resetGrade(item);
+    app?.render(false);
+  });
+
+  return wrapper;
+}
+
+/**
+ * Inject the grade control into the ITEM sheet (Details tab).
+ */
+function injectGradeUI(app, htmlArg) {
+  const item = app?.item ?? app?.object;
+  if (item?.type !== "weapon") return;
+
+  const root = (htmlArg instanceof HTMLElement)
+    ? htmlArg
+    : (htmlArg?.[0] instanceof HTMLElement ? htmlArg[0] : null);
+  if (!root) return;
+
+  const isApplied = !!(item.getFlag(FLAG_SCOPE, APPLIED_FLAG_KEY));
+  lockBaseDamageField(root, isApplied);
+
+  if (root.querySelector(`[data-${MODULE_ID}-field]`)) return;
+
+  const wrapper = buildGradeControl(item, app);
   const target =
     root.querySelector(".tab[data-tab='details']") ||
     root.querySelector(".sheet-body") ||
     root;
   target.prepend(wrapper);
+  log("Injected grade UI (item sheet) for", item.name);
+}
 
-  // Status line.
-  const status = wrapper.querySelector("[data-wg-status]");
-  if (status) {
-    status.textContent = isApplied
-      ? `Applied: ${GRADES[appliedKey]?.label ?? appliedKey}. Base damage is locked. Use Reset to edit.`
-      : `Not applied. Select a grade and click Apply.`;
+/**
+ * Inject the grade control into the ACTION sheet, anchored near the
+ * Materials section (falling back to Enhancement Bonus, then the form).
+ */
+function injectGradeUIAction(app, htmlArg) {
+  // The action sheet's document is an ItemAction; its parent is the item.
+  const action = app?.action ?? app?.object ?? app?.document;
+  const item = action?.item ?? action?.parent ?? app?.item;
+  if (!item || item.type !== "weapon") return;
+
+  const root = (htmlArg instanceof HTMLElement)
+    ? htmlArg
+    : (htmlArg?.[0] instanceof HTMLElement ? htmlArg[0] : null);
+  if (!root) return;
+
+  // Lock the damage formula field on the action sheet too.
+  const isApplied = !!(item.getFlag(FLAG_SCOPE, APPLIED_FLAG_KEY));
+  lockBaseDamageField(root, isApplied);
+
+  if (root.querySelector(`[data-${MODULE_ID}-field]`)) return;
+
+  const wrapper = buildGradeControl(item, app);
+
+  // Find an anchor. Prefer a "Materials" header; else the Enhancement Bonus
+  // form-group; else append to the first form/tab.
+  let anchor = null;
+
+  // Look for a heading containing "Material".
+  const headers = root.querySelectorAll("h1, h2, h3, h4, header, .form-header");
+  for (const h of headers) {
+    if (/material/i.test(h.textContent || "")) { anchor = h; break; }
   }
 
-  // Wire buttons.
-  wrapper.querySelector("[data-wg-apply]")?.addEventListener("click", async () => {
-    await applyGrade(item);
-    app.render(false);
-  });
-  wrapper.querySelector("[data-wg-reset]")?.addEventListener("click", async () => {
-    await resetGrade(item);
-    app.render(false);
-  });
+  // Else find the Enhancement Bonus field by its label text.
+  if (!anchor) {
+    const groups = root.querySelectorAll(".form-group");
+    for (const g of groups) {
+      const lbl = g.querySelector("label");
+      if (lbl && /enhancement/i.test(lbl.textContent || "")) { anchor = g; break; }
+    }
+  }
 
-  log("Injected grade UI for", item.name, "applied:", appliedKey);
+  if (anchor) {
+    anchor.parentElement?.insertBefore(wrapper, anchor);
+    log("Injected grade UI (action sheet) anchored near:", anchor.textContent?.trim()?.slice(0, 30));
+  } else {
+    const fallback = root.querySelector(".tab[data-tab='details']") ||
+                     root.querySelector("form") || root;
+    fallback.prepend(wrapper);
+    log("Injected grade UI (action sheet) at fallback location.");
+  }
 }
 
 /**
@@ -513,5 +580,80 @@ function lockBaseDamageField(root, lock) {
 }
 
 Hooks.on("renderItemSheet", injectGradeUI);
+Hooks.on("renderItemActionSheet", injectGradeUIAction);
+
+/* -------------------------------------------- */
+/*  Self-healing: re-apply if formula reverts    */
+/* -------------------------------------------- */
+
+/**
+ * When an item updates (e.g. after "Create Attack" regenerates the action),
+ * check whether a grade is supposed to be applied but the base damage has
+ * reverted to the pristine original. If so, silently re-apply the grade so
+ * it survives regeneration.
+ *
+ * Guarded against recursion: we only act when the CURRENT base equals the
+ * stored original (i.e. it got reset by something other than us) while an
+ * applied-grade flag is still set.
+ */
+let _healing = false;
+Hooks.on("updateItem", async (item, changes, options, userId) => {
+  if (_healing) return;
+  if (item?.type !== "weapon") return;
+  if (!item.isOwner) return;
+  if (game.user.id !== userId) return; // only the acting client heals
+
+  const appliedKey = item.getFlag(FLAG_SCOPE, APPLIED_FLAG_KEY);
+  if (!appliedKey) return; // nothing should be applied
+
+  const original = item.getFlag(FLAG_SCOPE, ORIG_FLAG_KEY);
+  if (!original) return;
+
+  const grade = GRADES[appliedKey];
+  if (!grade) return;
+
+  const currentBase = readBaseFormula(item);
+  if (!currentBase) return;
+
+  // Compute what the applied formula SHOULD look like.
+  const useLabel = game.settings.get(MODULE_ID, "inlineLabel");
+  const expected = buildGradedFormula(original, grade, useLabel ? grade.label : "");
+
+  // Normalize by stripping labels/whitespace for comparison.
+  const norm = (s) => (s || "").replace(/\[[^\]]*\]/g, "").replace(/\s+/g, "");
+
+  // Already correct? Nothing to do.
+  if (norm(currentBase) === norm(expected)) return;
+
+  // Only self-heal when the base looks like it was WIPED back to the pristine
+  // original (the Create Attack signature). We do NOT heal arbitrary
+  // mismatches, so that manually editing the dropdown or formula doesn't
+  // trigger an unwanted auto-apply.
+  const cleanOriginal = (() => {
+    const p = parseDamagePart(original);
+    if (!p) return norm(original);
+    let f = renderDice(p.count, p.faces, p);
+    if (p.flat > 0) f += `+${p.flat}`; else if (p.flat < 0) f += `${p.flat}`;
+    return norm(f);
+  })();
+
+  if (norm(currentBase) !== cleanOriginal) {
+    log(`Self-heal: base "${currentBase}" is neither graded nor pristine; leaving alone.`);
+    return;
+  }
+
+  log(`Self-heal: base reverted to original "${original}". Re-applying ${grade.label}.`);
+  _healing = true;
+  try {
+    // Ensure the selected-grade flag matches what should be applied, since
+    // applyGrade reads FLAG_KEY to decide what to apply.
+    if (item.getFlag(FLAG_SCOPE, FLAG_KEY) !== appliedKey) {
+      await item.setFlag(FLAG_SCOPE, FLAG_KEY, appliedKey);
+    }
+    await applyGrade(item);
+  } finally {
+    _healing = false;
+  }
+});
 
 log("Loaded.");
