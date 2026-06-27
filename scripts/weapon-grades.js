@@ -363,34 +363,40 @@ function allGradeLabels() {
 }
 
 /**
+ * Compute a new item.system.tags array: remove any of our grade labels, then
+ * add the requested one (unless clearing). Returns the new array.
+ */
+function computeItemTags(item, gradeTag, clearTags) {
+  const existing = Array.isArray(item.system?.tags) ? item.system.tags.slice() : [];
+  const labels = allGradeLabels();
+  const cleaned = existing.filter((t) => !labels.includes(t));
+  if (!clearTags && gradeTag) cleaned.push(gradeTag);
+  return cleaned;
+}
+
+/**
  * Write modified damage parts back into the action and apply flag updates
  * in a single item update. PF1 stores actions in system.actions as an array.
+ * Grade tags live on item.system.tags (the action has no tags field).
  *
- * @param {string|null} gradeTag  Label to add to the action's tags (or null).
+ * @param {string|null} gradeTag  Label to add to item.system.tags (or null).
  * @param {boolean} clearTags     If true, remove all our grade tags.
  */
 async function updateActionDamageParts(item, action, newParts, extraUpdates = {}, gradeTag = null, clearTags = false) {
   const actionsSource = foundry.utils.deepClone(item.system?.actions ?? []);
   const idx = actionsSource.findIndex((a) => a._id === action.id || a._id === action._id);
 
-  // Helper to compute a new tags array for an action source object.
-  const computeTags = (src) => {
-    const existing = Array.isArray(src.tags) ? src.tags.slice() : [];
-    const labels = allGradeLabels();
-    // Remove any prior grade tags first (so switching grades replaces).
-    const cleaned = existing.filter((t) => !labels.includes(t));
-    if (!clearTags && gradeTag) cleaned.push(gradeTag);
-    return cleaned;
-  };
+  // Tag updates go on the item, not the action.
+  const tagUpdate = {};
+  if (gradeTag !== null || clearTags) {
+    tagUpdate["system.tags"] = computeItemTags(item, gradeTag, clearTags);
+  }
 
   if (idx === -1) {
     if (typeof action.update === "function") {
-      const upd = { "damage.parts": newParts };
-      if (gradeTag !== null || clearTags) {
-        upd.tags = computeTags(action.toObject?.() ?? action);
-      }
-      await action.update(upd);
-      if (Object.keys(extraUpdates).length) await item.update(extraUpdates);
+      await action.update({ "damage.parts": newParts });
+      const merged = { ...extraUpdates, ...tagUpdate };
+      if (Object.keys(merged).length) await item.update(merged);
       return;
     }
     ui.notifications?.error("Weapon Grades: couldn't locate the action to update.");
@@ -399,13 +405,11 @@ async function updateActionDamageParts(item, action, newParts, extraUpdates = {}
 
   actionsSource[idx].damage = actionsSource[idx].damage ?? {};
   actionsSource[idx].damage.parts = newParts;
-  if (gradeTag !== null || clearTags) {
-    actionsSource[idx].tags = computeTags(actionsSource[idx]);
-  }
 
   await item.update({
     "system.actions": actionsSource,
-    ...extraUpdates
+    ...extraUpdates,
+    ...tagUpdate
   });
 }
 
